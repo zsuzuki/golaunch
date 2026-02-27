@@ -1,0 +1,665 @@
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+
+	"github.com/BurntSushi/toml"
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+type Arg struct {
+	Value   string `toml:"value"`
+	Enabled bool   `toml:"enabled"`
+}
+
+type CommandDef struct {
+	Title   string `toml:"title"`
+	Command string `toml:"command"`
+	Args    []Arg  `toml:"args"`
+}
+
+type Config struct {
+	Commands []CommandDef `toml:"commands"`
+}
+
+type screen int
+
+const (
+	screenList screen = iota
+	screenEdit
+)
+
+type inputTarget int
+
+const (
+	inputTitle inputTarget = iota
+	inputCommand
+	inputArg
+)
+
+type runResultMsg struct {
+	stdout string
+	stderr string
+	err    error
+}
+
+type model struct {
+	cwd string
+
+	cfg        Config
+	configPath string
+
+	width  int
+	height int
+
+	screen screen
+
+	listCursor    int
+	confirmDelete bool
+	confirmQuit   bool
+
+	editIndex  int
+	editCursor int
+
+	inputActive bool
+	inputTarget inputTarget
+	inputArgIdx int
+	input       textinput.Model
+
+	running bool
+	output  string
+	lastCmd string
+
+	styles styles
+}
+
+type styles struct {
+	base     lipgloss.Style
+	pane     lipgloss.Style
+	head     lipgloss.Style
+	normal   lipgloss.Style
+	selected lipgloss.Style
+	hint     lipgloss.Style
+	danger   lipgloss.Style
+	outTitle lipgloss.Style
+	outBody  lipgloss.Style
+}
+
+func defaultStyles() styles {
+	return styles{
+		base:   lipgloss.NewStyle().Padding(1, 1),
+		pane:   lipgloss.NewStyle().Border(lipgloss.NormalBorder()).Padding(1, 1),
+		head:   lipgloss.NewStyle().Bold(true),
+		normal: lipgloss.NewStyle().Foreground(lipgloss.Color("252")),
+		selected: lipgloss.NewStyle().
+			Background(lipgloss.Color("153")).
+			Foreground(lipgloss.Color("236")).
+			Bold(true),
+		hint:     lipgloss.NewStyle().Foreground(lipgloss.Color("245")),
+		danger:   lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Bold(true),
+		outTitle: lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81")),
+		outBody:  lipgloss.NewStyle().Foreground(lipgloss.Color("252")),
+	}
+}
+
+func newModel() model {
+	cwd, _ := os.Getwd()
+	cfgPath, err := resolveConfigPath()
+	if err != nil {
+		cfgPath = "./golaunch.toml"
+	}
+
+	cfg, _ := loadConfig(cfgPath)
+
+	ti := textinput.New()
+	ti.Placeholder = ""
+	ti.Focus()
+
+	ti.CharLimit = 512
+
+	ti.Width = 40
+
+	return model{
+		cwd:        cwd,
+		cfg:        cfg,
+		configPath: cfgPath,
+		screen:     screenList,
+		styles:     defaultStyles(),
+		input:      ti,
+		output:     "Output will appear here.\n",
+		lastCmd:    "(none)",
+	}
+}
+
+func (m model) Init() tea.Cmd {
+	return nil
+}
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		m.input.Width = max(20, msg.Width/3)
+		return m, nil
+
+	case runResultMsg:
+		m.running = false
+		var b strings.Builder
+		if msg.err != nil {
+			b.WriteString("Execution error: ")
+			b.WriteString(msg.err.Error())
+			b.WriteString("\n\n")
+		}
+		if msg.stdout != "" {
+			b.WriteString("[stdout]\n")
+			b.WriteString(msg.stdout)
+			if !strings.HasSuffix(msg.stdout, "\n") {
+				b.WriteString("\n")
+			}
+		}
+		if msg.stderr != "" {
+			if msg.stdout != "" {
+				b.WriteString("\n")
+			}
+			b.WriteString("[stderr]\n")
+			b.WriteString(msg.stderr)
+			if !strings.HasSuffix(msg.stderr, "\n") {
+				b.WriteString("\n")
+			}
+		}
+		if b.Len() == 0 {
+			b.WriteString("(no output)\n")
+		}
+		m.output = b.String()
+		return m, nil
+	}
+
+	if m.inputActive {
+		return m.updateInput(msg)
+	}
+
+	if keyMsg, ok := msg.(tea.KeyMsg); ok {
+		if m.confirmQuit {
+			switch keyMsg.String() {
+			case "y":
+				return m, tea.Quit
+			case "n", "esc":
+				m.confirmQuit = false
+				return m, nil
+			default:
+				return m, nil
+			}
+		}
+
+		switch keyMsg.String() {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "q":
+			m.confirmQuit = true
+			return m, nil
+		}
+	}
+
+	switch m.screen {
+	case screenList:
+		return m.updateList(msg)
+	case screenEdit:
+		return m.updateEdit(msg)
+	default:
+		return m, nil
+	}
+}
+
+func (m model) updateInput(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if keyMsg, ok := msg.(tea.KeyMsg); ok {
+		switch keyMsg.String() {
+		case "esc":
+			m.inputActive = false
+			return m, nil
+		case "enter":
+			value := m.input.Value()
+			if m.editIndex >= 0 && m.editIndex < len(m.cfg.Commands) {
+				switch m.inputTarget {
+				case inputTitle:
+					m.cfg.Commands[m.editIndex].Title = value
+				case inputCommand:
+					m.cfg.Commands[m.editIndex].Command = value
+				case inputArg:
+					if m.inputArgIdx >= 0 && m.inputArgIdx < len(m.cfg.Commands[m.editIndex].Args) {
+						m.cfg.Commands[m.editIndex].Args[m.inputArgIdx].Value = value
+					}
+				}
+				_ = saveConfig(m.configPath, m.cfg)
+			}
+			m.inputActive = false
+			return m, nil
+		}
+	}
+
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
+}
+
+func (m model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
+	keyMsg, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return m, nil
+	}
+
+	if m.confirmDelete {
+		switch keyMsg.String() {
+		case "y":
+			if m.listCursor >= 0 && m.listCursor < len(m.cfg.Commands) {
+				m.cfg.Commands = append(m.cfg.Commands[:m.listCursor], m.cfg.Commands[m.listCursor+1:]...)
+				if m.listCursor >= len(m.cfg.Commands) && m.listCursor > 0 {
+					m.listCursor--
+				}
+				_ = saveConfig(m.configPath, m.cfg)
+			}
+			m.confirmDelete = false
+			return m, nil
+		case "n", "esc":
+			m.confirmDelete = false
+			return m, nil
+		default:
+			return m, nil
+		}
+	}
+
+	switch keyMsg.String() {
+	case "up", "k":
+		if m.listCursor > 0 {
+			m.listCursor--
+		}
+	case "down", "j":
+		if m.listCursor < len(m.cfg.Commands)-1 {
+			m.listCursor++
+		}
+	case "enter":
+		if len(m.cfg.Commands) == 0 {
+			return m, nil
+		}
+		m.screen = screenEdit
+		m.editIndex = m.listCursor
+		m.editCursor = 0
+	case "a":
+		m.cfg.Commands = append(m.cfg.Commands, CommandDef{})
+		m.listCursor = len(m.cfg.Commands) - 1
+		m.editIndex = m.listCursor
+		m.editCursor = 0
+		m.screen = screenEdit
+		_ = saveConfig(m.configPath, m.cfg)
+	case "d":
+		if len(m.cfg.Commands) > 0 {
+			m.confirmDelete = true
+		}
+	case "r":
+		if len(m.cfg.Commands) == 0 {
+			return m, nil
+		}
+		cmdRef := m.cfg.Commands[m.listCursor]
+		if strings.TrimSpace(cmdRef.Command) == "" {
+			m.output = "Execution error: command is empty\n"
+			return m, nil
+		}
+		m.running = true
+		m.lastCmd = buildCommandLine(cmdRef)
+		m.output = "Running...\n"
+		return m, runCommand(m.cwd, cmdRef)
+	}
+	return m, nil
+}
+
+func (m model) updateEdit(msg tea.Msg) (tea.Model, tea.Cmd) {
+	keyMsg, ok := msg.(tea.KeyMsg)
+	if !ok {
+		return m, nil
+	}
+
+	if m.editIndex < 0 || m.editIndex >= len(m.cfg.Commands) {
+		m.screen = screenList
+		return m, nil
+	}
+
+	cmdRef := &m.cfg.Commands[m.editIndex]
+	maxCursor := 2 + len(cmdRef.Args)
+
+	switch keyMsg.String() {
+	case "esc":
+		m.screen = screenList
+		return m, nil
+	case "up", "k":
+		if m.editCursor > 0 {
+			m.editCursor--
+		}
+	case "down", "j":
+		if m.editCursor < maxCursor {
+			m.editCursor++
+		}
+	case "+":
+		argIdx := m.editCursor - 2
+		if argIdx >= 0 && argIdx < len(cmdRef.Args) {
+			insertAt := argIdx + 1
+			cmdRef.Args = append(cmdRef.Args[:insertAt], append([]Arg{{}}, cmdRef.Args[insertAt:]...)...)
+			m.editCursor = 2 + insertAt
+		} else {
+			cmdRef.Args = append(cmdRef.Args, Arg{})
+			m.editCursor = 2 + len(cmdRef.Args) - 1
+		}
+		_ = saveConfig(m.configPath, m.cfg)
+	case "ctrl+d", "del", "delete":
+		argIdx := m.editCursor - 2
+		if argIdx >= 0 && argIdx < len(cmdRef.Args) {
+			cmdRef.Args = append(cmdRef.Args[:argIdx], cmdRef.Args[argIdx+1:]...)
+			runIdx := 2 + len(cmdRef.Args)
+			if m.editCursor > runIdx {
+				m.editCursor = runIdx
+			}
+			_ = saveConfig(m.configPath, m.cfg)
+		}
+	case " ":
+		argIdx := m.editCursor - 2
+		if argIdx >= 0 && argIdx < len(cmdRef.Args) {
+			cmdRef.Args[argIdx].Enabled = !cmdRef.Args[argIdx].Enabled
+			_ = saveConfig(m.configPath, m.cfg)
+		}
+	case "enter":
+		switch {
+		case m.editCursor == 0:
+			m.startInput(inputTitle, -1, cmdRef.Title)
+		case m.editCursor == 1:
+			m.startInput(inputCommand, -1, cmdRef.Command)
+		case m.editCursor >= 2 && m.editCursor < 2+len(cmdRef.Args):
+			argIdx := m.editCursor - 2
+			m.startInput(inputArg, argIdx, cmdRef.Args[argIdx].Value)
+		default:
+			_ = saveConfig(m.configPath, m.cfg)
+			if cmdRef.Command == "" {
+				m.output = "Execution error: command is empty\n"
+				return m, nil
+			}
+			m.running = true
+			m.lastCmd = buildCommandLine(*cmdRef)
+			m.output = "Running...\n"
+			return m, runCommand(m.cwd, *cmdRef)
+		}
+	}
+
+	return m, nil
+}
+
+func (m *model) startInput(target inputTarget, argIdx int, current string) {
+	m.inputTarget = target
+	m.inputArgIdx = argIdx
+	m.input.SetValue(current)
+	m.input.CursorEnd()
+	m.inputActive = true
+}
+
+func runCommand(cwd string, cmdDef CommandDef) tea.Cmd {
+	return func() tea.Msg {
+		args := make([]string, 0, len(cmdDef.Args))
+		for _, a := range cmdDef.Args {
+			if a.Enabled {
+				args = append(args, a.Value)
+			}
+		}
+
+		cmd := exec.Command(cmdDef.Command, args...)
+		cmd.Dir = cwd
+
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+
+		err := cmd.Run()
+		return runResultMsg{
+			stdout: stdout.String(),
+			stderr: stderr.String(),
+			err:    err,
+		}
+	}
+}
+
+func buildCommandLine(cmdDef CommandDef) string {
+	args := make([]string, 0, len(cmdDef.Args))
+	for _, a := range cmdDef.Args {
+		if a.Enabled {
+			args = append(args, shellQuote(a.Value))
+		}
+	}
+	cmd := shellQuote(cmdDef.Command)
+	if len(args) == 0 {
+		return cmd
+	}
+	return cmd + " " + strings.Join(args, " ")
+}
+
+func shellQuote(s string) string {
+	if s == "" {
+		return "''"
+	}
+	if !strings.ContainsAny(s, " \t\n'\"\\$`!&|;()<>*?[]{}") {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
+func (m model) View() string {
+	if m.width == 0 || m.height == 0 {
+		return "loading..."
+	}
+
+	leftW := min(52, max(36, m.width/2))
+	rightW := max(20, m.width-leftW-3)
+	bodyH := max(8, m.height-4)
+
+	left := m.renderLeft(leftW, bodyH)
+	right := m.renderRight(rightW, bodyH)
+
+	return m.styles.base.Render(lipgloss.JoinHorizontal(lipgloss.Top, left, right))
+}
+
+func (m model) renderLeft(w, h int) string {
+	content := ""
+	if m.screen == screenList {
+		content = m.renderList()
+	} else {
+		content = m.renderEdit()
+	}
+
+	pane := m.styles.pane.Width(w).Height(h)
+	return pane.Render(content)
+}
+
+func (m model) renderList() string {
+	var lines []string
+	lines = append(lines, m.styles.head.Render(fmt.Sprintf("Current Dir: %s", m.cwd)))
+	lines = append(lines, "")
+
+	if len(m.cfg.Commands) == 0 {
+		lines = append(lines, m.styles.hint.Render("(no commands)"))
+	} else {
+		for i, c := range m.cfg.Commands {
+			title := c.Title
+			if strings.TrimSpace(title) == "" {
+				title = "(untitled command)"
+			}
+			line := "  " + title
+			if i == m.listCursor {
+				line = m.styles.selected.Render(line)
+			} else {
+				line = m.styles.normal.Render(line)
+			}
+			lines = append(lines, line)
+		}
+	}
+
+	lines = append(lines, "")
+	if m.confirmDelete {
+		lines = append(lines, m.styles.danger.Render("Delete selected command? (y/n)"))
+	} else if m.confirmQuit {
+		lines = append(lines, m.styles.danger.Render("Quit golaunch? (y/n)"))
+	} else {
+		lines = append(lines, m.styles.hint.Render("up/down: select  enter: edit  r: run  a: add  d: delete  q: quit"))
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func (m model) renderEdit() string {
+	if m.editIndex < 0 || m.editIndex >= len(m.cfg.Commands) {
+		return "invalid command index"
+	}
+	cmdRef := m.cfg.Commands[m.editIndex]
+
+	var lines []string
+	lines = append(lines, m.styles.head.Render(fmt.Sprintf("Current Dir: %s", m.cwd)))
+	lines = append(lines, "")
+
+	titleLine := "Title: " + cmdRef.Title
+	if m.editCursor == 0 {
+		titleLine = m.renderSelectedEditLine(titleLine, inputTitle, -1)
+	} else {
+		titleLine = m.styles.normal.Render(titleLine)
+	}
+	lines = append(lines, titleLine)
+
+	cmdLine := "Command: " + cmdRef.Command
+	if m.editCursor == 1 {
+		cmdLine = m.renderSelectedEditLine(cmdLine, inputCommand, -1)
+	} else {
+		cmdLine = m.styles.normal.Render(cmdLine)
+	}
+	lines = append(lines, cmdLine)
+
+	lines = append(lines, m.styles.normal.Render("Args:"))
+	for i, a := range cmdRef.Args {
+		mark := " "
+		if a.Enabled {
+			mark = "*"
+		}
+		argLine := fmt.Sprintf("      [%s]: %s", mark, a.Value)
+		if m.editCursor == i+2 {
+			argLine = m.renderSelectedEditLine(argLine, inputArg, i)
+		} else {
+			argLine = m.styles.normal.Render(argLine)
+		}
+		lines = append(lines, argLine)
+	}
+
+	runIdx := 2 + len(cmdRef.Args)
+	runLine := "[Run]"
+	if m.running {
+		runLine = "[Running...]"
+	}
+	if m.editCursor == runIdx {
+		runLine = m.styles.selected.Render("  " + runLine)
+	} else {
+		runLine = m.styles.normal.Render("  " + runLine)
+	}
+	lines = append(lines, runLine)
+
+	lines = append(lines, "")
+	lines = append(lines, m.styles.hint.Render("up/down: move  enter: edit/run  +: add below  space: toggle arg  ctrl+d/del: delete arg  esc: back  q: quit"))
+	if m.confirmQuit {
+		lines = append(lines, m.styles.danger.Render("Quit golaunch? (y/n)"))
+	}
+	if m.inputActive {
+		lines = append(lines, m.styles.hint.Render("Editing: type and press Enter to save (Esc to cancel)"))
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func (m model) renderSelectedEditLine(fallback string, target inputTarget, argIdx int) string {
+	if m.inputActive && m.inputTarget == target && m.inputArgIdx == argIdx {
+		return m.styles.selected.Render("  " + m.input.View())
+	}
+	return m.styles.selected.Render(fallback)
+}
+
+func (m model) renderRight(w, h int) string {
+	cmdLine := m.styles.hint.Render("Command: " + m.lastCmd)
+	title := m.styles.outTitle.Render("I/O")
+	body := trimToHeight(m.output, h-5)
+	pane := m.styles.pane.Width(w).Height(h)
+	return pane.Render(cmdLine + "\n\n" + title + "\n\n" + m.styles.outBody.Render(body))
+}
+
+func trimToHeight(s string, h int) string {
+	if h <= 0 {
+		return ""
+	}
+	lines := strings.Split(strings.ReplaceAll(s, "\r\n", "\n"), "\n")
+	if len(lines) <= h {
+		return strings.Join(lines, "\n")
+	}
+	return strings.Join(lines[len(lines)-h:], "\n")
+}
+
+func resolveConfigPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".config", "golaunch", "golaunch.toml"), nil
+}
+
+func loadConfig(path string) (Config, error) {
+	var cfg Config
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return cfg, nil
+		}
+		return cfg, err
+	}
+	_, err := toml.DecodeFile(path, &cfg)
+	return cfg, err
+}
+
+func saveConfig(path string, cfg Config) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	enc := toml.NewEncoder(f)
+	return enc.Encode(cfg)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func main() {
+	p := tea.NewProgram(newModel(), tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
