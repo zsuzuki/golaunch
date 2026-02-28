@@ -331,7 +331,7 @@ func (m model) updateEdit(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	cmdRef := &m.cfg.Commands[m.editIndex]
-	maxCursor := 2 + len(cmdRef.Args)
+	maxCursor := 1 + len(cmdRef.Args)
 
 	switch keyMsg.String() {
 	case "esc":
@@ -360,12 +360,22 @@ func (m model) updateEdit(msg tea.Msg) (tea.Model, tea.Cmd) {
 		argIdx := m.editCursor - 2
 		if argIdx >= 0 && argIdx < len(cmdRef.Args) {
 			cmdRef.Args = append(cmdRef.Args[:argIdx], cmdRef.Args[argIdx+1:]...)
-			runIdx := 2 + len(cmdRef.Args)
-			if m.editCursor > runIdx {
-				m.editCursor = runIdx
+			lastIdx := 1 + len(cmdRef.Args)
+			if m.editCursor > lastIdx {
+				m.editCursor = lastIdx
 			}
 			_ = saveConfig(m.configPath, m.cfg)
 		}
+	case "r":
+		_ = saveConfig(m.configPath, m.cfg)
+		if cmdRef.Command == "" {
+			m.output = "Execution error: command is empty\n"
+			return m, nil
+		}
+		m.running = true
+		m.lastCmd = buildCommandLine(*cmdRef)
+		m.output = "Running...\n"
+		return m, runCommand(m.cwd, *cmdRef)
 	case " ":
 		argIdx := m.editCursor - 2
 		if argIdx >= 0 && argIdx < len(cmdRef.Args) {
@@ -381,16 +391,6 @@ func (m model) updateEdit(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case m.editCursor >= 2 && m.editCursor < 2+len(cmdRef.Args):
 			argIdx := m.editCursor - 2
 			m.startInput(inputArg, argIdx, cmdRef.Args[argIdx].Value)
-		default:
-			_ = saveConfig(m.configPath, m.cfg)
-			if cmdRef.Command == "" {
-				m.output = "Execution error: command is empty\n"
-				return m, nil
-			}
-			m.running = true
-			m.lastCmd = buildCommandLine(*cmdRef)
-			m.output = "Running...\n"
-			return m, runCommand(m.cwd, *cmdRef)
 		}
 	}
 
@@ -558,20 +558,8 @@ func (m model) renderEdit() string {
 		lines = append(lines, argLine)
 	}
 
-	runIdx := 2 + len(cmdRef.Args)
-	runLine := "[Run]"
-	if m.running {
-		runLine = "[Running...]"
-	}
-	if m.editCursor == runIdx {
-		runLine = m.styles.selected.Render("  " + runLine)
-	} else {
-		runLine = m.styles.normal.Render("  " + runLine)
-	}
-	lines = append(lines, runLine)
-
 	lines = append(lines, "")
-	lines = append(lines, m.styles.hint.Render("up/down: move  enter: edit/run  +: add below  space: toggle arg  ctrl+d/del: delete arg  esc: back  q: quit"))
+	lines = append(lines, m.styles.hint.Render("up/down: move  enter: edit  r: run  +: add below  space: toggle arg  ctrl+d/del: delete arg  esc: back  q: quit"))
 	if m.confirmQuit {
 		lines = append(lines, m.styles.danger.Render("Quit golaunch? (y/n)"))
 	}
