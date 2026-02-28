@@ -45,11 +45,12 @@ go build -o golaunch .
 ### Edit Screen
 
 - `up/down` (`k/j`): 項目移動
-- `enter`: 項目編集 / `[Run]` 実行
+- `enter`: 項目編集
 - `+`: 引数を追加（引数行選択中はその直下に追加）
 - `space`: 選択引数の有効/無効トグル
 - `ctrl+d` / `del`: 選択引数を削除
 - `esc`: 一覧画面へ戻る
+- `r`: 現在の設定でコマンドを実行
 - `q`: 終了確認
 
 ## Config
