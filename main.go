@@ -364,6 +364,20 @@ func (m model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.editCursor = 0
 		m.screen = screenEdit
 		_ = saveConfig(m.configPath, m.cfg)
+	case "c":
+		if len(m.cfg.Commands) == 0 || m.listCursor < 0 || m.listCursor >= len(m.cfg.Commands) {
+			return m, nil
+		}
+		src := m.cfg.Commands[m.listCursor]
+		clone := CommandDef{
+			Title:   src.Title,
+			Command: src.Command,
+			Args:    append([]Arg(nil), src.Args...),
+		}
+		insertAt := m.listCursor + 1
+		m.cfg.Commands = append(m.cfg.Commands[:insertAt], append([]CommandDef{clone}, m.cfg.Commands[insertAt:]...)...)
+		m.listCursor = insertAt
+		_ = saveConfig(m.configPath, m.cfg)
 	case "d":
 		if len(m.cfg.Commands) > 0 {
 			m.confirmDelete = true
@@ -626,7 +640,7 @@ func (m model) renderList() string {
 	} else if m.confirmQuit {
 		lines = append(lines, m.styles.danger.Render("Quit golaunch? (y/n)"))
 	} else {
-		lines = append(lines, m.styles.hint.Render("up/down: select  enter: edit  r: run  a: add  d: delete  q: quit"))
+		lines = append(lines, m.styles.hint.Render("up/down: select  enter: edit  r: run  a: add  c: clone  d: delete  q: quit"))
 	}
 
 	return strings.Join(lines, "\n")
