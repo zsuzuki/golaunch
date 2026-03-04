@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/BurntSushi/toml"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -50,6 +51,15 @@ type runResultMsg struct {
 	err    error
 }
 
+type processStartedMsg struct {
+	proc *runningProcess
+}
+
+type runningProcess struct {
+	cmd  *exec.Cmd
+	done chan runResultMsg
+}
+
 type model struct {
 	cwd string
 
@@ -76,6 +86,7 @@ type model struct {
 	running bool
 	output  string
 	lastCmd string
+	proc    *runningProcess
 
 	styles styles
 }
@@ -152,6 +163,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case runResultMsg:
 		m.running = false
+		m.proc = nil
 		var b strings.Builder
 		if msg.err != nil {
 			b.WriteString("Execution error: ")
@@ -180,6 +192,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.output = b.String()
 		return m, nil
+
+	case processStartedMsg:
+		m.proc = msg.proc
+		if m.proc == nil {
+			m.running = false
+			return m, nil
+		}
+		return m, waitForProcessDone(m.proc.done)
 	}
 
 	if m.inputActive {
@@ -187,6 +207,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
+		if m.running {
+			return m.handleRunningKey(keyMsg)
+		}
+
 		if m.confirmQuit {
 			switch keyMsg.String() {
 			case "y":
@@ -216,6 +240,48 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	default:
 		return m, nil
 	}
+}
+
+func (m model) handleRunningKey(keyMsg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch keyMsg.String() {
+	case "ctrl+c", "i":
+		return m.sendSignal(syscall.SIGINT)
+	case "ctrl+\\\\", "K":
+		return m.sendSignal(syscall.SIGKILL)
+	default:
+		return m, nil
+	}
+}
+
+func (m model) sendSignal(sig syscall.Signal) (tea.Model, tea.Cmd) {
+	if m.proc == nil || m.proc.cmd == nil || m.proc.cmd.Process == nil {
+		m.appendOutput(fmt.Sprintf("Cannot send %s: no active process.\n", signalName(sig)))
+		return m, nil
+	}
+
+	pid := m.proc.cmd.Process.Pid
+	err := syscall.Kill(-pid, sig)
+	if err != nil {
+		err = m.proc.cmd.Process.Signal(sig)
+	}
+	if err != nil {
+		m.appendOutput(fmt.Sprintf("Failed to send %s: %v\n", signalName(sig), err))
+		return m, nil
+	}
+
+	m.appendOutput(fmt.Sprintf("Sent %s to running process (pid=%d)\n", signalName(sig), pid))
+	return m, nil
+}
+
+func (m *model) appendOutput(s string) {
+	if m.output == "" {
+		m.output = s
+		return
+	}
+	if !strings.HasSuffix(m.output, "\n") {
+		m.output += "\n"
+	}
+	m.output += s
 }
 
 func (m model) updateInput(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -312,9 +378,12 @@ func (m model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.running = true
+		m.inputActive = false
+		m.confirmDelete = false
+		m.confirmQuit = false
 		m.lastCmd = buildCommandLine(cmdRef)
 		m.output = "Running...\n"
-		return m, runCommand(m.cwd, cmdRef)
+		return m, startRunCommand(m.cwd, cmdRef)
 	}
 	return m, nil
 }
@@ -373,9 +442,11 @@ func (m model) updateEdit(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.running = true
+		m.inputActive = false
+		m.confirmQuit = false
 		m.lastCmd = buildCommandLine(*cmdRef)
 		m.output = "Running...\n"
-		return m, runCommand(m.cwd, *cmdRef)
+		return m, startRunCommand(m.cwd, *cmdRef)
 	case " ":
 		argIdx := m.editCursor - 2
 		if argIdx >= 0 && argIdx < len(cmdRef.Args) {
@@ -405,7 +476,7 @@ func (m *model) startInput(target inputTarget, argIdx int, current string) {
 	m.inputActive = true
 }
 
-func runCommand(cwd string, cmdDef CommandDef) tea.Cmd {
+func startRunCommand(cwd string, cmdDef CommandDef) tea.Cmd {
 	return func() tea.Msg {
 		args := make([]string, 0, len(cmdDef.Args))
 		for _, a := range cmdDef.Args {
@@ -416,18 +487,60 @@ func runCommand(cwd string, cmdDef CommandDef) tea.Cmd {
 
 		cmd := exec.Command(cmdDef.Command, args...)
 		cmd.Dir = cwd
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 		var stdout bytes.Buffer
 		var stderr bytes.Buffer
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr
 
-		err := cmd.Run()
-		return runResultMsg{
-			stdout: stdout.String(),
-			stderr: stderr.String(),
-			err:    err,
+		proc := &runningProcess{
+			cmd:  cmd,
+			done: make(chan runResultMsg, 1),
 		}
+
+		if err := cmd.Start(); err != nil {
+			proc.done <- runResultMsg{
+				stdout: stdout.String(),
+				stderr: stderr.String(),
+				err:    err,
+			}
+			close(proc.done)
+			return processStartedMsg{proc: proc}
+		}
+
+		go func() {
+			err := cmd.Wait()
+			proc.done <- runResultMsg{
+				stdout: stdout.String(),
+				stderr: stderr.String(),
+				err:    err,
+			}
+			close(proc.done)
+		}()
+
+		return processStartedMsg{proc: proc}
+	}
+}
+
+func waitForProcessDone(done <-chan runResultMsg) tea.Cmd {
+	return func() tea.Msg {
+		msg, ok := <-done
+		if !ok {
+			return runResultMsg{err: fmt.Errorf("process ended without result")}
+		}
+		return msg
+	}
+}
+
+func signalName(sig syscall.Signal) string {
+	switch sig {
+	case syscall.SIGINT:
+		return "SIGINT"
+	case syscall.SIGKILL:
+		return "SIGKILL"
+	default:
+		return fmt.Sprintf("signal %d", sig)
 	}
 }
 
@@ -508,6 +621,8 @@ func (m model) renderList() string {
 	lines = append(lines, "")
 	if m.confirmDelete {
 		lines = append(lines, m.styles.danger.Render("Delete selected command? (y/n)"))
+	} else if m.running {
+		lines = append(lines, m.styles.danger.Render("RUNNING: controls locked  ctrl+c/i: SIGINT  ctrl+\\ or K: SIGKILL"))
 	} else if m.confirmQuit {
 		lines = append(lines, m.styles.danger.Render("Quit golaunch? (y/n)"))
 	} else {
@@ -559,7 +674,11 @@ func (m model) renderEdit() string {
 	}
 
 	lines = append(lines, "")
-	lines = append(lines, m.styles.hint.Render("up/down: move  enter: edit  r: run  +: add below  space: toggle arg  ctrl+d/del: delete arg  esc: back  q: quit"))
+	if m.running {
+		lines = append(lines, m.styles.danger.Render("RUNNING: controls locked  ctrl+c/i: SIGINT  ctrl+\\ or K: SIGKILL"))
+	} else {
+		lines = append(lines, m.styles.hint.Render("up/down: move  enter: edit  r: run  +: add below  space: toggle arg  ctrl+d/del: delete arg  esc: back  q: quit"))
+	}
 	if m.confirmQuit {
 		lines = append(lines, m.styles.danger.Render("Quit golaunch? (y/n)"))
 	}
@@ -578,9 +697,18 @@ func (m model) renderSelectedEditLine(fallback string, target inputTarget, argId
 }
 
 func (m model) renderRight(w, h int) string {
-	cmdLine := m.styles.hint.Render("Command: " + m.lastCmd)
+	bodyWidth := max(1, w-4)
+	cmdLine := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("245")).
+		Width(bodyWidth).
+		MaxWidth(bodyWidth).
+		Render("Command: " + m.lastCmd)
 	title := m.styles.outTitle.Render("I/O")
 	body := trimToHeight(m.output, h-5)
+	body = lipgloss.NewStyle().
+		Width(bodyWidth).
+		MaxWidth(bodyWidth).
+		Render(body)
 	pane := m.styles.pane.Width(w).Height(h)
 	return pane.Render(cmdLine + "\n\n" + title + "\n\n" + m.styles.outBody.Render(body))
 }
