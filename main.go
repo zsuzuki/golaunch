@@ -8,9 +8,11 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
 	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -27,7 +29,8 @@ type CommandDef struct {
 }
 
 type Config struct {
-	Commands []CommandDef `toml:"commands"`
+	OutputBufferBytes int          `toml:"output_buffer_bytes"`
+	Commands          []CommandDef `toml:"commands"`
 }
 
 type screen int
@@ -83,13 +86,16 @@ type model struct {
 	inputArgIdx int
 	input       textinput.Model
 
-	running bool
-	output  string
-	lastCmd string
-	proc    *runningProcess
+	running  bool
+	output   string
+	lastCmd  string
+	proc     *runningProcess
+	outputVP viewport.Model
 
 	styles styles
 }
+
+const defaultOutputBufferBytes = 1024 * 1024
 
 type styles struct {
 	base     lipgloss.Style
@@ -137,16 +143,20 @@ func newModel() model {
 
 	ti.Width = 40
 
-	return model{
+	vp := viewport.New(1, 1)
+
+	m := model{
 		cwd:        cwd,
 		cfg:        cfg,
 		configPath: cfgPath,
 		screen:     screenList,
 		styles:     defaultStyles(),
 		input:      ti,
-		output:     "Output will appear here.\n",
 		lastCmd:    "(none)",
+		outputVP:   vp,
 	}
+	m.setOutput("Output will appear here.\n")
+	return m
 }
 
 func (m model) Init() tea.Cmd {
@@ -159,6 +169,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.input.Width = max(20, msg.Width/3)
+		m.syncOutputViewport(false)
 		return m, nil
 
 	case runResultMsg:
@@ -190,7 +201,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if b.Len() == 0 {
 			b.WriteString("(no output)\n")
 		}
-		m.output = b.String()
+		m.setOutput(b.String())
 		return m, nil
 
 	case processStartedMsg:
@@ -207,6 +218,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	if keyMsg, ok := msg.(tea.KeyMsg); ok {
+		if m.handleOutputScroll(keyMsg) {
+			return m, nil
+		}
+
 		if m.running {
 			return m.handleRunningKey(keyMsg)
 		}
@@ -253,6 +268,25 @@ func (m model) handleRunningKey(keyMsg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
+func (m *model) handleOutputScroll(keyMsg tea.KeyMsg) bool {
+	switch keyMsg.String() {
+	case "pgup":
+		m.outputVP.ViewUp()
+		return true
+	case "pgdown":
+		m.outputVP.ViewDown()
+		return true
+	case "home":
+		m.outputVP.GotoTop()
+		return true
+	case "end":
+		m.outputVP.GotoBottom()
+		return true
+	default:
+		return false
+	}
+}
+
 func (m model) sendSignal(sig syscall.Signal) (tea.Model, tea.Cmd) {
 	if m.proc == nil || m.proc.cmd == nil || m.proc.cmd.Process == nil {
 		m.appendOutput(fmt.Sprintf("Cannot send %s: no active process.\n", signalName(sig)))
@@ -275,13 +309,40 @@ func (m model) sendSignal(sig syscall.Signal) (tea.Model, tea.Cmd) {
 
 func (m *model) appendOutput(s string) {
 	if m.output == "" {
-		m.output = s
+		m.setOutput(s)
 		return
 	}
-	if !strings.HasSuffix(m.output, "\n") {
-		m.output += "\n"
+	next := m.output
+	if !strings.HasSuffix(next, "\n") {
+		next += "\n"
 	}
-	m.output += s
+	next += s
+	m.setOutput(next)
+}
+
+func (m *model) setOutput(s string) {
+	m.output = limitOutputBytes(s, m.outputBufferBytes())
+	m.syncOutputViewport(true)
+}
+
+func (m model) outputBufferBytes() int {
+	if m.cfg.OutputBufferBytes > 0 {
+		return m.cfg.OutputBufferBytes
+	}
+	return defaultOutputBufferBytes
+}
+
+func (m *model) syncOutputViewport(stickToBottom bool) {
+	bodyWidth, bodyHeight := m.rightPaneBodySize(m.rightPaneWidth(), m.paneBodyHeight())
+
+	wasAtBottom := m.outputVP.AtBottom()
+	m.outputVP.Width = bodyWidth
+	m.outputVP.Height = bodyHeight
+	m.outputVP.SetContent(wrapOutput(m.output, bodyWidth))
+
+	if stickToBottom || wasAtBottom {
+		m.outputVP.GotoBottom()
+	}
 }
 
 func (m model) updateInput(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -388,7 +449,7 @@ func (m model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		cmdRef := m.cfg.Commands[m.listCursor]
 		if strings.TrimSpace(cmdRef.Command) == "" {
-			m.output = "Execution error: command is empty\n"
+			m.setOutput("Execution error: command is empty\n")
 			return m, nil
 		}
 		m.running = true
@@ -396,7 +457,7 @@ func (m model) updateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.confirmDelete = false
 		m.confirmQuit = false
 		m.lastCmd = buildCommandLine(cmdRef)
-		m.output = "Running...\n"
+		m.setOutput("Running...\n")
 		return m, startRunCommand(m.cwd, cmdRef)
 	}
 	return m, nil
@@ -452,14 +513,14 @@ func (m model) updateEdit(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case "r":
 		_ = saveConfig(m.configPath, m.cfg)
 		if cmdRef.Command == "" {
-			m.output = "Execution error: command is empty\n"
+			m.setOutput("Execution error: command is empty\n")
 			return m, nil
 		}
 		m.running = true
 		m.inputActive = false
 		m.confirmQuit = false
 		m.lastCmd = buildCommandLine(*cmdRef)
-		m.output = "Running...\n"
+		m.setOutput("Running...\n")
 		return m, startRunCommand(m.cwd, *cmdRef)
 	case " ":
 		argIdx := m.editCursor - 2
@@ -587,14 +648,26 @@ func (m model) View() string {
 		return "loading..."
 	}
 
-	leftW := min(52, max(36, m.width/2))
-	rightW := max(20, m.width-leftW-3)
-	bodyH := max(8, m.height-4)
+	leftW := m.leftPaneWidth()
+	rightW := m.rightPaneWidth()
+	bodyH := m.paneBodyHeight()
 
 	left := m.renderLeft(leftW, bodyH)
 	right := m.renderRight(rightW, bodyH)
 
 	return m.styles.base.Render(lipgloss.JoinHorizontal(lipgloss.Top, left, right))
+}
+
+func (m model) leftPaneWidth() int {
+	return min(52, max(36, m.width/2))
+}
+
+func (m model) rightPaneWidth() int {
+	return max(20, m.width-m.leftPaneWidth()-3)
+}
+
+func (m model) paneBodyHeight() int {
+	return max(8, m.height-4)
 }
 
 func (m model) renderLeft(w, h int) string {
@@ -711,31 +784,44 @@ func (m model) renderSelectedEditLine(fallback string, target inputTarget, argId
 }
 
 func (m model) renderRight(w, h int) string {
-	bodyWidth := max(1, w-4)
+	bodyWidth, bodyHeight := m.rightPaneBodySize(w, h)
 	cmdLine := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("245")).
 		Width(bodyWidth).
 		MaxWidth(bodyWidth).
 		Render("Command: " + m.lastCmd)
 	title := m.styles.outTitle.Render("I/O")
-	body := trimToHeight(m.output, h-5)
-	body = lipgloss.NewStyle().
-		Width(bodyWidth).
-		MaxWidth(bodyWidth).
-		Render(body)
+	body := m.styles.outBody.Render(m.outputVP.View())
 	pane := m.styles.pane.Width(w).Height(h)
-	return pane.Render(cmdLine + "\n\n" + title + "\n\n" + m.styles.outBody.Render(body))
+	footer := m.styles.hint.Render("PgUp/PgDn: scroll  Home/End: top/bottom")
+	content := lipgloss.JoinVertical(lipgloss.Left,
+		cmdLine,
+		"",
+		title,
+		"",
+		lipgloss.NewStyle().Width(bodyWidth).Height(bodyHeight).Render(body),
+		"",
+		footer,
+	)
+	return pane.Render(content)
 }
 
-func trimToHeight(s string, h int) string {
-	if h <= 0 {
-		return ""
-	}
-	lines := strings.Split(strings.ReplaceAll(s, "\r\n", "\n"), "\n")
-	if len(lines) <= h {
-		return strings.Join(lines, "\n")
-	}
-	return strings.Join(lines[len(lines)-h:], "\n")
+func (m model) rightPaneBodySize(w, h int) (int, int) {
+	frameW := m.styles.pane.GetHorizontalFrameSize()
+	frameH := m.styles.pane.GetVerticalFrameSize()
+	innerW := max(1, w-frameW)
+	innerH := max(1, h-frameH)
+
+	cmdLine := lipgloss.NewStyle().
+		Width(innerW).
+		MaxWidth(innerW).
+		Render("Command: " + m.lastCmd)
+	title := m.styles.outTitle.Render("I/O")
+	footer := m.styles.hint.Render("PgUp/PgDn: scroll  Home/End: top/bottom")
+
+	reservedHeight := lipgloss.Height(cmdLine) + lipgloss.Height(title) + lipgloss.Height(footer) + 3
+	bodyH := max(1, innerH-reservedHeight)
+	return innerW, bodyH
 }
 
 func resolveConfigPath() (string, error) {
@@ -770,6 +856,48 @@ func saveConfig(path string, cfg Config) error {
 
 	enc := toml.NewEncoder(f)
 	return enc.Encode(cfg)
+}
+
+func wrapOutput(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	normalized := strings.ReplaceAll(s, "\r\n", "\n")
+	if normalized == "" {
+		return ""
+	}
+	return lipgloss.NewStyle().Width(width).MaxWidth(width).Render(normalized)
+}
+
+func limitOutputBytes(s string, limit int) string {
+	if limit <= 0 || len(s) <= limit {
+		return s
+	}
+
+	prefix := fmt.Sprintf("(output truncated to last %d bytes)\n\n", limit)
+	if len(prefix) >= limit {
+		return safeUTF8Suffix(s, limit)
+	}
+
+	return prefix + safeUTF8Suffix(s, limit-len(prefix))
+}
+
+func safeUTF8Suffix(s string, limit int) string {
+	if limit <= 0 || s == "" {
+		return ""
+	}
+	if len(s) <= limit {
+		return s
+	}
+
+	start := len(s) - limit
+	for start < len(s) && !utf8.ValidString(s[start:]) {
+		start++
+	}
+	if start >= len(s) {
+		return ""
+	}
+	return s[start:]
 }
 
 func min(a, b int) int {
