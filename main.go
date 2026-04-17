@@ -862,11 +862,21 @@ func wrapOutput(s string, width int) string {
 	if width <= 0 {
 		return ""
 	}
-	normalized := strings.ReplaceAll(s, "\r\n", "\n")
+	normalized := normalizeOutputForDisplay(s)
 	if normalized == "" {
 		return ""
 	}
 	return lipgloss.NewStyle().Width(width).MaxWidth(width).Render(normalized)
+}
+
+func normalizeOutputForDisplay(s string) string {
+	if s == "" {
+		return ""
+	}
+
+	normalized := strings.ReplaceAll(s, "\r\n", "\n")
+	normalized = strings.ReplaceAll(normalized, "\r", "\n")
+	return normalized
 }
 
 func limitOutputBytes(s string, limit int) string {
